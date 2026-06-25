@@ -1,0 +1,300 @@
+name: Apple Silicon MLX Inference Demo
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mlx-apple-silicon:
+    name: MLX on Apple Silicon macOS 26
+    runs-on: macos-26
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reset workspace
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf results smoke .venv
+          mkdir -p results smoke
+
+      - name: Environment diagnostics
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          {
+            echo "# Apple Silicon MLX diagnostics"
+            echo
+            echo "## Date"
+            date
+            echo
+            echo "## uname"
+            uname -a
+            echo
+            echo "## macOS"
+            sw_vers
+            echo
+            echo "## CPU"
+            sysctl -n machdep.cpu.brand_string || true
+            echo
+            echo "## Memory"
+            sysctl hw.memsize || true
+            echo
+            echo "## Hardware"
+            system_profiler SPHardwareDataType || true
+            echo
+            echo "## Python"
+            which python3 || true
+            python3 --version || true
+          } | tee results/00_environment.md
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 -m venv .venv
+          source .venv/bin/activate
+
+          python -m pip install --upgrade pip
+          python -m pip install mlx mlx-lm numpy pandas
+
+          python - <<'PY' | tee results/python_packages.txt
+          import importlib.metadata as m
+          for p in ["mlx", "mlx-lm", "numpy", "pandas"]:
+              try:
+                  print(p, m.version(p))
+              except Exception as e:
+                  print(p, "missing", e)
+          PY
+
+      - name: Verify MLX Apple GPU
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+
+          python - <<'PY' | tee results/mlx_smoke.txt
+          import mlx.core as mx
+
+          print("MLX default device:", mx.default_device())
+
+          a = mx.ones((1024, 1024), dtype=mx.float16)
+          b = a @ a
+          mx.eval(b)
+
+          print("MLX tensor execution OK:", b.shape)
+          PY
+
+      - name: MLX inference-level component benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+
+          cat > smoke/mlx_component_bench.py <<'PY'
+          import json
+          import platform
+          import time
+          import mlx.core as mx
+
+          def bench(name, fn, warmup=5, iters=20):
+              for _ in range(warmup):
+                  y = fn()
+                  mx.eval(y)
+
+              times = []
+              for _ in range(iters):
+                  t0 = time.perf_counter()
+                  y = fn()
+                  mx.eval(y)
+                  times.append(time.perf_counter() - t0)
+
+              return {
+                  "backend": "MLX",
+                  "experiment": name,
+                  "avg_ms": sum(times) / len(times) * 1000,
+                  "min_ms": min(times) * 1000,
+                  "max_ms": max(times) * 1000,
+                  "iters": iters,
+                  "device": str(mx.default_device()),
+                  "platform": platform.platform(),
+              }
+
+          heads = 8
+          head_dim = 64
+
+          seq_short = 256
+          seq_mid = 512
+          seq_long = 1024
+
+          q_short = mx.random.normal((1, heads, seq_short, head_dim), dtype=mx.float16)
+          k_short = mx.random.normal((1, heads, seq_short, head_dim), dtype=mx.float16)
+          v_short = mx.random.normal((1, heads, seq_short, head_dim), dtype=mx.float16)
+
+          q_mid = mx.random.normal((1, heads, seq_mid, head_dim), dtype=mx.float16)
+          k_mid = mx.random.normal((1, heads, seq_mid, head_dim), dtype=mx.float16)
+          v_mid = mx.random.normal((1, heads, seq_mid, head_dim), dtype=mx.float16)
+
+          q_long = mx.random.normal((1, heads, seq_long, head_dim), dtype=mx.float16)
+          k_long = mx.random.normal((1, heads, seq_long, head_dim), dtype=mx.float16)
+          v_long = mx.random.normal((1, heads, seq_long, head_dim), dtype=mx.float16)
+
+          q_decode = mx.random.normal((1, heads, 1, head_dim), dtype=mx.float16)
+          kv_256 = mx.random.normal((1, heads, 256, head_dim), dtype=mx.float16)
+          kv_512 = mx.random.normal((1, heads, 512, head_dim), dtype=mx.float16)
+          kv_1024 = mx.random.normal((1, heads, 1024, head_dim), dtype=mx.float16)
+
+          def attention(q, k, v):
+              scores = q @ mx.swapaxes(k, -1, -2)
+              probs = mx.softmax(scores / 8.0, axis=-1)
+              return probs @ v
+
+          def decode(kv):
+              scores = q_decode @ mx.swapaxes(kv, -1, -2)
+              probs = mx.softmax(scores / 8.0, axis=-1)
+              return probs @ kv
+
+          results = [
+              bench("prefill_proxy_seq256", lambda: attention(q_short, k_short, v_short), iters=20),
+              bench("prefill_proxy_seq512", lambda: attention(q_mid, k_mid, v_mid), iters=15),
+              bench("prefill_proxy_seq1024", lambda: attention(q_long, k_long, v_long), iters=8),
+              bench("decode_proxy_kv256", lambda: decode(kv_256), iters=50),
+              bench("decode_proxy_kv512", lambda: decode(kv_512), iters=50),
+              bench("decode_proxy_kv1024", lambda: decode(kv_1024), iters=50),
+          ]
+
+          print(json.dumps(results, indent=2))
+          PY
+
+          python smoke/mlx_component_bench.py | tee results/mlx_component_bench.json
+
+      - name: MLX end-to-end generation smoke test
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+
+          cat > smoke/mlx_lm_smoke.py <<'PY'
+          import json
+          import time
+          from mlx_lm import load, generate
+
+          model_name = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+          prompt = "Explain local LLM inference performance in one concise paragraph."
+
+          t0 = time.perf_counter()
+          model, tokenizer = load(model_name)
+          load_s = time.perf_counter() - t0
+
+          t1 = time.perf_counter()
+          text = generate(
+              model,
+              tokenizer,
+              prompt=prompt,
+              max_tokens=128,
+              verbose=False,
+          )
+          gen_s = time.perf_counter() - t1
+
+          result = {
+              "backend": "MLX",
+              "model": model_name,
+              "prompt_chars": len(prompt),
+              "output_chars": len(text),
+              "load_seconds": load_s,
+              "generation_seconds": gen_s,
+              "output_preview": text[:500],
+          }
+
+          print(json.dumps(result, indent=2))
+          PY
+
+          python smoke/mlx_lm_smoke.py | tee results/mlx_lm_generation_smoke.json
+
+      - name: Generate report
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cat > smoke/report.py <<'PY'
+          import json
+          from pathlib import Path
+
+          base = Path("results")
+
+          def load_json(name):
+              p = base / name
+              if not p.exists():
+                  return None
+              txt = p.read_text(errors="replace").strip()
+              starts = [i for i in [txt.find("["), txt.find("{")] if i >= 0]
+              if starts:
+                  txt = txt[min(starts):]
+              try:
+                  return json.loads(txt)
+              except Exception:
+                  return None
+
+          comps = load_json("mlx_component_bench.json") or []
+          gen = load_json("mlx_lm_generation_smoke.json")
+
+          lines = []
+          lines.append("# Apple Silicon MLX Demo Report")
+          lines.append("")
+          lines.append("## Aim")
+          lines.append("")
+          lines.append("Validate MLX on GitHub-hosted macOS 26 Apple Silicon runners as the Apple/Metal backend for heterogeneous local LLM inference experiments.")
+          lines.append("")
+          lines.append("## Component-level MLX results")
+          lines.append("")
+          lines.append("| Experiment | Avg ms | Min ms | Max ms | Device |")
+          lines.append("|---|---:|---:|---:|---|")
+
+          for r in comps:
+              lines.append(
+                  f"| {r.get('experiment')} | {float(r.get('avg_ms')):.4f} | {float(r.get('min_ms')):.4f} | {float(r.get('max_ms')):.4f} | {r.get('device')} |"
+              )
+
+          lines.append("")
+          lines.append("## End-to-end MLX generation")
+          lines.append("")
+
+          if gen:
+              lines.append(f"- Model: `{gen.get('model')}`")
+              lines.append(f"- Load time: `{float(gen.get('load_seconds')):.3f}` seconds")
+              lines.append(f"- Generation time: `{float(gen.get('generation_seconds')):.3f}` seconds")
+              lines.append(f"- Output chars: `{gen.get('output_chars')}`")
+              lines.append("")
+              lines.append("### Output preview")
+              lines.append("")
+              lines.append("```")
+              lines.append(str(gen.get("output_preview", "")))
+              lines.append("```")
+          else:
+              lines.append("- End-to-end MLX generation smoke test did not complete.")
+
+          lines.append("")
+          lines.append("## Interpretation")
+          lines.append("")
+          lines.append("- MLX provides the Apple Silicon / Metal comparison point against CUDA, Vulkan, and SYCL.")
+          lines.append("- The prefill/decode-style component proxies can be compared against CUDA and Vulkan proxy measurements.")
+          lines.append("- The next research question is whether these inference-level proxies predict end-to-end MLX behaviour similarly to the CUDA proxy result.")
+
+          (base / "APPLE_MLX_REPORT.md").write_text("\n".join(lines))
+          print("\n".join(lines))
+          PY
+
+          python3 smoke/report.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-silicon-mlx-macos-26-results
+          path: results/
