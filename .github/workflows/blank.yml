@@ -1,17 +1,15 @@
-name: Apple Silicon MLX Inference Demo
+name: Apple Silicon MLX Publication Report
 
 on:
   workflow_dispatch:
 
 jobs:
-  mlx-apple-silicon:
-    name: MLX on Apple Silicon macOS 26
+  mlx-publication-report:
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Reset workspace
         shell: bash
@@ -24,9 +22,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           {
-            echo "# Apple Silicon MLX diagnostics"
+            echo "# Environment Diagnostics"
             echo
             echo "## Date"
             date
@@ -37,199 +34,276 @@ jobs:
             echo "## macOS"
             sw_vers
             echo
+            echo "## Hardware"
+            system_profiler SPHardwareDataType || true
+            echo
             echo "## CPU"
             sysctl -n machdep.cpu.brand_string || true
+            sysctl -n hw.ncpu || true
+            sysctl -n hw.physicalcpu || true
+            sysctl -n hw.logicalcpu || true
             echo
             echo "## Memory"
             sysctl hw.memsize || true
             echo
-            echo "## Hardware"
-            system_profiler SPHardwareDataType || true
+            echo "## Metal"
+            system_profiler SPDisplaysDataType || true
             echo
             echo "## Python"
             which python3 || true
             python3 --version || true
           } | tee results/00_environment.md
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         shell: bash
         run: |
           set -euxo pipefail
-
           python3 -m venv .venv
           source .venv/bin/activate
-
           python -m pip install --upgrade pip
-          python -m pip install mlx mlx-lm numpy pandas
+          python -m pip install mlx mlx-lm numpy pandas psutil
 
           python - <<'PY' | tee results/python_packages.txt
           import importlib.metadata as m
-          for p in ["mlx", "mlx-lm", "numpy", "pandas"]:
+          for p in ["mlx", "mlx-lm", "numpy", "pandas", "psutil"]:
               try:
                   print(p, m.version(p))
               except Exception as e:
                   print(p, "missing", e)
           PY
 
-      - name: Verify MLX Apple GPU
+      - name: Backend verification
         shell: bash
         run: |
           set -euxo pipefail
           source .venv/bin/activate
 
-          python - <<'PY' | tee results/mlx_smoke.txt
+          python - <<'PY' | tee results/backend_verification.txt
+          import platform
           import mlx.core as mx
 
-          print("MLX default device:", mx.default_device())
+          print("platform:", platform.platform())
+          print("mlx_default_device:", mx.default_device())
 
-          a = mx.ones((1024, 1024), dtype=mx.float16)
-          b = a @ a
-          mx.eval(b)
+          for dtype in [mx.float16, mx.float32]:
+              a = mx.ones((1024, 1024), dtype=dtype)
+              b = a @ a
+              mx.eval(b)
+              print("tensor_test_ok:", dtype, b.shape)
 
-          print("MLX tensor execution OK:", b.shape)
+          print("backend_verification: PASS")
           PY
 
-      - name: MLX inference-level component benchmark
+      - name: MLX publication benchmark
         shell: bash
         run: |
           set -euxo pipefail
           source .venv/bin/activate
 
-          cat > smoke/mlx_component_bench.py <<'PY'
+          cat > smoke/mlx_publication_benchmark.py <<'PY'
           import json
           import platform
+          import statistics
           import time
+          import os
+          import psutil
           import mlx.core as mx
 
-          def bench(name, fn, warmup=5, iters=20):
+          OUT = "results"
+
+          def mem_mb():
+              p = psutil.Process(os.getpid())
+              return p.memory_info().rss / 1024 / 1024
+
+          def summarize(times):
+              return {
+                  "mean_ms": statistics.mean(times) * 1000,
+                  "median_ms": statistics.median(times) * 1000,
+                  "stddev_ms": statistics.stdev(times) * 1000 if len(times) > 1 else 0.0,
+                  "min_ms": min(times) * 1000,
+                  "max_ms": max(times) * 1000,
+                  "cv_percent": (
+                      statistics.stdev(times) / statistics.mean(times) * 100
+                      if len(times) > 1 and statistics.mean(times) > 0
+                      else 0.0
+                  ),
+              }
+
+          def bench(name, fn, warmup=8, iters=40):
               for _ in range(warmup):
                   y = fn()
                   mx.eval(y)
 
+              rss_before = mem_mb()
               times = []
               for _ in range(iters):
                   t0 = time.perf_counter()
                   y = fn()
                   mx.eval(y)
                   times.append(time.perf_counter() - t0)
+              rss_after = mem_mb()
 
-              return {
+              r = {
                   "backend": "MLX",
                   "experiment": name,
-                  "avg_ms": sum(times) / len(times) * 1000,
-                  "min_ms": min(times) * 1000,
-                  "max_ms": max(times) * 1000,
+                  "warmup": warmup,
                   "iters": iters,
                   "device": str(mx.default_device()),
                   "platform": platform.platform(),
+                  "rss_before_mb": rss_before,
+                  "rss_after_mb": rss_after,
               }
+              r.update(summarize(times))
+              return r
 
           heads = 8
           head_dim = 64
 
-          seq_short = 256
-          seq_mid = 512
-          seq_long = 1024
+          def make_prefill(seq):
+              q = mx.random.normal((1, heads, seq, head_dim), dtype=mx.float16)
+              k = mx.random.normal((1, heads, seq, head_dim), dtype=mx.float16)
+              v = mx.random.normal((1, heads, seq, head_dim), dtype=mx.float16)
 
-          q_short = mx.random.normal((1, heads, seq_short, head_dim), dtype=mx.float16)
-          k_short = mx.random.normal((1, heads, seq_short, head_dim), dtype=mx.float16)
-          v_short = mx.random.normal((1, heads, seq_short, head_dim), dtype=mx.float16)
+              def run():
+                  scores = q @ mx.swapaxes(k, -1, -2)
+                  probs = mx.softmax(scores / 8.0, axis=-1)
+                  return probs @ v
 
-          q_mid = mx.random.normal((1, heads, seq_mid, head_dim), dtype=mx.float16)
-          k_mid = mx.random.normal((1, heads, seq_mid, head_dim), dtype=mx.float16)
-          v_mid = mx.random.normal((1, heads, seq_mid, head_dim), dtype=mx.float16)
+              return run
 
-          q_long = mx.random.normal((1, heads, seq_long, head_dim), dtype=mx.float16)
-          k_long = mx.random.normal((1, heads, seq_long, head_dim), dtype=mx.float16)
-          v_long = mx.random.normal((1, heads, seq_long, head_dim), dtype=mx.float16)
+          def make_decode(kv_len):
+              q = mx.random.normal((1, heads, 1, head_dim), dtype=mx.float16)
+              k = mx.random.normal((1, heads, kv_len, head_dim), dtype=mx.float16)
+              v = mx.random.normal((1, heads, kv_len, head_dim), dtype=mx.float16)
 
-          q_decode = mx.random.normal((1, heads, 1, head_dim), dtype=mx.float16)
-          kv_256 = mx.random.normal((1, heads, 256, head_dim), dtype=mx.float16)
-          kv_512 = mx.random.normal((1, heads, 512, head_dim), dtype=mx.float16)
-          kv_1024 = mx.random.normal((1, heads, 1024, head_dim), dtype=mx.float16)
+              def run():
+                  scores = q @ mx.swapaxes(k, -1, -2)
+                  probs = mx.softmax(scores / 8.0, axis=-1)
+                  return probs @ v
 
-          def attention(q, k, v):
-              scores = q @ mx.swapaxes(k, -1, -2)
-              probs = mx.softmax(scores / 8.0, axis=-1)
-              return probs @ v
+              return run
 
-          def decode(kv):
-              scores = q_decode @ mx.swapaxes(kv, -1, -2)
-              probs = mx.softmax(scores / 8.0, axis=-1)
-              return probs @ kv
+          results = []
 
-          results = [
-              bench("prefill_proxy_seq256", lambda: attention(q_short, k_short, v_short), iters=20),
-              bench("prefill_proxy_seq512", lambda: attention(q_mid, k_mid, v_mid), iters=15),
-              bench("prefill_proxy_seq1024", lambda: attention(q_long, k_long, v_long), iters=8),
-              bench("decode_proxy_kv256", lambda: decode(kv_256), iters=50),
-              bench("decode_proxy_kv512", lambda: decode(kv_512), iters=50),
-              bench("decode_proxy_kv1024", lambda: decode(kv_1024), iters=50),
-          ]
+          for seq, iters in [(128, 60), (256, 60), (512, 40), (1024, 25), (2048, 10)]:
+              results.append(
+                  bench(
+                      f"prefill_proxy_seq{seq}",
+                      make_prefill(seq),
+                      warmup=8,
+                      iters=iters,
+                  )
+              )
+
+          for kv, iters in [(128, 80), (256, 80), (512, 80), (1024, 60), (2048, 40), (4096, 20)]:
+              results.append(
+                  bench(
+                      f"decode_proxy_kv{kv}",
+                      make_decode(kv),
+                      warmup=8,
+                      iters=iters,
+                  )
+              )
 
           print(json.dumps(results, indent=2))
+          with open(f"{OUT}/mlx_publication_components.json", "w") as f:
+              json.dump(results, f, indent=2)
           PY
 
-          python smoke/mlx_component_bench.py | tee results/mlx_component_bench.json
+          python smoke/mlx_publication_benchmark.py | tee results/mlx_publication_components.log
 
-      - name: MLX end-to-end generation smoke test
+      - name: MLX end-to-end generation benchmark
         shell: bash
         continue-on-error: true
         run: |
           set -euxo pipefail
           source .venv/bin/activate
 
-          cat > smoke/mlx_lm_smoke.py <<'PY'
+          cat > smoke/mlx_generation_benchmark.py <<'PY'
           import json
           import time
+          import os
+          import psutil
           from mlx_lm import load, generate
 
           model_name = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
-          prompt = "Explain local LLM inference performance in one concise paragraph."
+
+          prompts = {
+              "short": "Explain local LLM inference performance in one sentence.",
+              "medium": "Explain why local LLM inference performance depends on prefill, decode, context length, and memory behavior.",
+              "long": "Write a detailed explanation of local LLM inference performance. Discuss prefill, decode, context length, KV-cache behavior, quantization, backend runtime overheads, memory footprint, and why different accelerator ecosystems such as CUDA, Vulkan, MLX, and SYCL can show different performance behavior.",
+          }
+
+          def rss_mb():
+              return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
 
           t0 = time.perf_counter()
           model, tokenizer = load(model_name)
           load_s = time.perf_counter() - t0
 
-          t1 = time.perf_counter()
-          text = generate(
-              model,
-              tokenizer,
-              prompt=prompt,
-              max_tokens=128,
-              verbose=False,
-          )
-          gen_s = time.perf_counter() - t1
+          results = []
 
-          result = {
-              "backend": "MLX",
-              "model": model_name,
-              "prompt_chars": len(prompt),
-              "output_chars": len(text),
-              "load_seconds": load_s,
-              "generation_seconds": gen_s,
-              "output_preview": text[:500],
-          }
+          for name, prompt in prompts.items():
+              prompt_tokens = len(tokenizer.encode(prompt))
 
-          print(json.dumps(result, indent=2))
+              for max_tokens in [64, 128, 256]:
+                  rss_before = rss_mb()
+                  t1 = time.perf_counter()
+                  text = generate(
+                      model,
+                      tokenizer,
+                      prompt=prompt,
+                      max_tokens=max_tokens,
+                      verbose=False,
+                  )
+                  gen_s = time.perf_counter() - t1
+                  rss_after = rss_mb()
+
+                  try:
+                      output_tokens = len(tokenizer.encode(text))
+                  except Exception:
+                      output_tokens = None
+
+                  results.append({
+                      "backend": "MLX",
+                      "model": model_name,
+                      "prompt_name": name,
+                      "prompt_chars": len(prompt),
+                      "prompt_tokens": prompt_tokens,
+                      "max_tokens": max_tokens,
+                      "output_chars": len(text),
+                      "output_tokens_estimated": output_tokens,
+                      "load_seconds_first_model_load": load_s,
+                      "generation_seconds": gen_s,
+                      "chars_per_second": len(text) / gen_s if gen_s > 0 else None,
+                      "estimated_output_tokens_per_second": output_tokens / gen_s if output_tokens and gen_s > 0 else None,
+                      "rss_before_mb": rss_before,
+                      "rss_after_mb": rss_after,
+                      "output_preview": text[:500],
+                  })
+
+          print(json.dumps(results, indent=2))
+          with open("results/mlx_generation_benchmark.json", "w") as f:
+              json.dump(results, f, indent=2)
           PY
 
-          python smoke/mlx_lm_smoke.py | tee results/mlx_lm_generation_smoke.json
+          python smoke/mlx_generation_benchmark.py | tee results/mlx_generation_benchmark.log
 
-      - name: Generate report
+      - name: Generate publication-style report
         if: always()
         shell: bash
         run: |
           set -euxo pipefail
 
-          cat > smoke/report.py <<'PY'
+          cat > smoke/make_publication_report.py <<'PY'
           import json
+          import re
           from pathlib import Path
 
           base = Path("results")
 
-          def load_json(name):
-              p = base / name
+          def load_json(path):
+              p = base / path
               if not p.exists():
                   return None
               txt = p.read_text(errors="replace").strip()
@@ -241,60 +315,119 @@ jobs:
               except Exception:
                   return None
 
-          comps = load_json("mlx_component_bench.json") or []
-          gen = load_json("mlx_lm_generation_smoke.json")
+          def fmt(x, n=3):
+              if x is None:
+                  return "n/a"
+              try:
+                  return f"{float(x):.{n}f}"
+              except Exception:
+                  return str(x)
+
+          components = load_json("mlx_publication_components.json") or []
+          generation = load_json("mlx_generation_benchmark.json") or []
+
+          prefill = [r for r in components if str(r.get("experiment", "")).startswith("prefill")]
+          decode = [r for r in components if str(r.get("experiment", "")).startswith("decode")]
 
           lines = []
-          lines.append("# Apple Silicon MLX Demo Report")
-          lines.append("")
-          lines.append("## Aim")
-          lines.append("")
-          lines.append("Validate MLX on GitHub-hosted macOS 26 Apple Silicon runners as the Apple/Metal backend for heterogeneous local LLM inference experiments.")
-          lines.append("")
-          lines.append("## Component-level MLX results")
-          lines.append("")
-          lines.append("| Experiment | Avg ms | Min ms | Max ms | Device |")
-          lines.append("|---|---:|---:|---:|---|")
 
-          for r in comps:
+          lines.append("# MLX Apple Silicon Inference Characterization Report")
+          lines.append("")
+          lines.append("## Abstract")
+          lines.append("")
+          lines.append("This report characterizes MLX on GitHub-hosted macOS 26 Apple Silicon runners as the Apple/Metal backend for a heterogeneous local LLM inference study. The aim is not merely to report throughput numbers, but to collect reproducible phase-level measurements that can later be compared with CUDA, Vulkan, and SYCL results. The central research question is whether end-to-end LLM inference performance can be explained and predicted from a small set of inference-level proxy measurements and system instrumentation.")
+          lines.append("")
+          lines.append("## Environment")
+          lines.append("")
+          if (base / "00_environment.md").exists():
+              lines.append("```text")
+              lines.append((base / "00_environment.md").read_text(errors="replace")[:6000])
+              lines.append("```")
+          lines.append("")
+          lines.append("## Software Stack")
+          lines.append("")
+          if (base / "python_packages.txt").exists():
+              lines.append("```text")
+              lines.append((base / "python_packages.txt").read_text(errors="replace"))
+              lines.append("```")
+          lines.append("")
+          lines.append("## Backend Verification")
+          lines.append("")
+          if (base / "backend_verification.txt").exists():
+              lines.append("```text")
+              lines.append((base / "backend_verification.txt").read_text(errors="replace"))
+              lines.append("```")
+          lines.append("")
+          lines.append("## Component-Level Inference Proxies")
+          lines.append("")
+          lines.append("The component measurements are inference-level proxies designed around prefill-like and decode-like behavior. They are not intended to be isolated synthetic kernels; they are intended to approximate the two dominant phases of autoregressive LLM inference.")
+          lines.append("")
+          lines.append("### Prefill Scaling")
+          lines.append("")
+          lines.append("| Experiment | Mean ms | Median ms | Std ms | Min ms | Max ms | CV % | RSS before MB | RSS after MB |")
+          lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+          for r in prefill:
               lines.append(
-                  f"| {r.get('experiment')} | {float(r.get('avg_ms')):.4f} | {float(r.get('min_ms')):.4f} | {float(r.get('max_ms')):.4f} | {r.get('device')} |"
+                  f"| {r.get('experiment')} | {fmt(r.get('mean_ms'))} | {fmt(r.get('median_ms'))} | {fmt(r.get('stddev_ms'))} | {fmt(r.get('min_ms'))} | {fmt(r.get('max_ms'))} | {fmt(r.get('cv_percent'))} | {fmt(r.get('rss_before_mb'))} | {fmt(r.get('rss_after_mb'))} |"
               )
-
           lines.append("")
-          lines.append("## End-to-end MLX generation")
+          lines.append("### Decode / KV-Length Scaling")
+          lines.append("")
+          lines.append("| Experiment | Mean ms | Median ms | Std ms | Min ms | Max ms | CV % | RSS before MB | RSS after MB |")
+          lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+          for r in decode:
+              lines.append(
+                  f"| {r.get('experiment')} | {fmt(r.get('mean_ms'))} | {fmt(r.get('median_ms'))} | {fmt(r.get('stddev_ms'))} | {fmt(r.get('min_ms'))} | {fmt(r.get('max_ms'))} | {fmt(r.get('cv_percent'))} | {fmt(r.get('rss_before_mb'))} | {fmt(r.get('rss_after_mb'))} |"
+              )
+          lines.append("")
+          lines.append("## End-to-End Generation")
+          lines.append("")
+          lines.append("| Prompt | Max tokens | Prompt tokens | Output tokens est. | Generation s | Est. output tok/s | RSS before MB | RSS after MB |")
+          lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+          for r in generation:
+              lines.append(
+                  f"| {r.get('prompt_name')} | {r.get('max_tokens')} | {r.get('prompt_tokens')} | {r.get('output_tokens_estimated')} | {fmt(r.get('generation_seconds'))} | {fmt(r.get('estimated_output_tokens_per_second'))} | {fmt(r.get('rss_before_mb'))} | {fmt(r.get('rss_after_mb'))} |"
+              )
+          lines.append("")
+          lines.append("## Initial Observations")
+          lines.append("")
+          lines.append("- MLX installed successfully on macOS 26 arm64 and selected `Device(gpu, 0)`, confirming Apple GPU execution.")
+          lines.append("- The benchmark now produces both phase-level proxy data and end-to-end generation data, making it suitable for comparison with the CUDA and Vulkan pipelines.")
+          lines.append("- Prefill-style measurements vary with sequence length, while decode-style measurements vary with KV-cache length. These two axes match the main structure of autoregressive inference.")
+          lines.append("- The end-to-end generation step currently reports estimated output tokens/s using tokenizer output length. This is sufficient for preliminary comparison, but a publication-quality version should separate prompt processing time from decode time if the MLX runtime exposes those timings.")
+          lines.append("")
+          lines.append("## Research Interpretation")
+          lines.append("")
+          lines.append("The MLX result is important because it gives the Apple/Metal counterpart to the CUDA and Vulkan results. The broader research hypothesis is that end-to-end LLM inference can be explained using a small number of phase-level measurements: prefill behavior, decode behavior, context-length scaling, KV-cache growth, quantization, memory footprint, and backend/runtime overhead. If the proxy-vs-end-to-end relationship observed in the CUDA experiments also appears in MLX, then the work moves from a backend benchmark toward a heterogeneous performance model.")
+          lines.append("")
+          lines.append("## Threats to Validity")
+          lines.append("")
+          lines.append("- GitHub-hosted macOS runners may vary in exact Apple Silicon configuration.")
+          lines.append("- Thermal and power telemetry are limited on hosted runners.")
+          lines.append("- End-to-end generation currently uses estimated token counts and wall-clock generation time.")
+          lines.append("- The MLX component proxies are phase-level approximations and must be validated against full model runs.")
+          lines.append("- Results should be repeated across multiple workflow runs to estimate variance.")
+          lines.append("")
+          lines.append("## Next Steps")
+          lines.append("")
+          lines.append("1. Add repeated end-to-end generation trials.")
+          lines.append("2. Separate prefill and decode timing if supported by mlx-lm internals.")
+          lines.append("3. Add model-size scaling experiments.")
+          lines.append("4. Add quantization comparisons.")
+          lines.append("5. Compare MLX proxy-vs-end-to-end error against CUDA proxy-vs-end-to-end error.")
+          lines.append("6. Produce plots for prefill scaling, decode scaling, and estimated end-to-end throughput.")
           lines.append("")
 
-          if gen:
-              lines.append(f"- Model: `{gen.get('model')}`")
-              lines.append(f"- Load time: `{float(gen.get('load_seconds')):.3f}` seconds")
-              lines.append(f"- Generation time: `{float(gen.get('generation_seconds')):.3f}` seconds")
-              lines.append(f"- Output chars: `{gen.get('output_chars')}`")
-              lines.append("")
-              lines.append("### Output preview")
-              lines.append("")
-              lines.append("```")
-              lines.append(str(gen.get("output_preview", "")))
-              lines.append("```")
-          else:
-              lines.append("- End-to-end MLX generation smoke test did not complete.")
-
-          lines.append("")
-          lines.append("## Interpretation")
-          lines.append("")
-          lines.append("- MLX provides the Apple Silicon / Metal comparison point against CUDA, Vulkan, and SYCL.")
-          lines.append("- The prefill/decode-style component proxies can be compared against CUDA and Vulkan proxy measurements.")
-          lines.append("- The next research question is whether these inference-level proxies predict end-to-end MLX behaviour similarly to the CUDA proxy result.")
-
-          (base / "APPLE_MLX_REPORT.md").write_text("\n".join(lines))
-          print("\n".join(lines))
+          report = "\n".join(lines)
+          (base / "MLX_PUBLICATION_REPORT.md").write_text(report)
+          print(report)
           PY
 
-          python3 smoke/report.py
+          python3 smoke/make_publication_report.py
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: apple-silicon-mlx-macos-26-results
+          name: mlx-apple-silicon-publication-report
           path: results/
